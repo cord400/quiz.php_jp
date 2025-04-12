@@ -34,3 +34,5 @@ index.php
 ├── config/
 
 │   ├── db.php(データベースの位置など)
+
+│   ├── xxxx.png
