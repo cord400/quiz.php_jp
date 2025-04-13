@@ -1,42 +1,105 @@
 <?php
-require_once './config/db.php';
+// quiz.php
 session_start();
+require_once('config/db.php');
 
-$user_id = $_SESSION['user_id'] ?? $_COOKIE['user_id'] ?? null;
-if (!$user_id) {
-    header('Location: account/login.php');
-    exit;
+if (!isset($_SESSION['user'])) {
+  header('Location: account/login.php');
+  exit;
 }
 
-// 問題取得
-$stmt = $pdo->query("SELECT * FROM quiz ORDER BY RAND() LIMIT 1");
+// ランダムで1問取得
+$stmt = $pdo->query("SELECT * FROM Quiz ORDER BY RAND() LIMIT 1");
 $quiz = $stmt->fetch();
 
+if (!$quiz) {
+  echo "<p>クイズが見つかりません。</p>";
+  exit;
+}
+
+$quiz_id = $quiz['id'];
+$format = $quiz['形式'];
+$question = $quiz['問題'];
+$explanation = $quiz['解説'];
+
+// 回答処理
+$result_message = "";
+$correct = false;
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $user_answer = trim($_POST['answer']);
-    $correct = ($user_answer === $quiz['answer']);
+  $user_answer = trim($_POST['answer']);
 
-    // 答えを記録
-    $stmt = $pdo->prepare("INSERT INTO quiz_result (user_id, quiz_id, correct) VALUES (?, ?, ?)");
-    $stmt->execute([$user_id, $quiz['id'], $correct ? 1 : 0]);
-
-    // 正解数をアップデート
-    if ($correct) {
-        $pdo->prepare("UPDATE user SET correct_count = correct_count + 1 WHERE id = ?")->execute([$user_id]);
-        echo "<script>alert('Correct!');location.href='quiz.php';</script>";
-    } else {
-        echo "<script>alert('Wrong! Answer: {$quiz['answer']}');location.href='quiz.php';</script>";
+  if ($format === '選択式') {
+    $stmt = $pdo->prepare("SELECT 選択式 FROM 選択式 WHERE id = ?");
+    $stmt->execute([$quiz_id]);
+    $answers = explode(',', $stmt->fetchColumn());
+    $correct_answer = $answers[0]; // 最初が正解と仮定
+    if ($user_answer === $correct_answer) {
+      $correct = true;
     }
+  } else {
+    $stmt = $pdo->prepare("SELECT 答え FROM 記述式 WHERE id = ?");
+    $stmt->execute([$quiz_id]);
+    $correct_answer = trim($stmt->fetchColumn());
+    if ($user_answer === $correct_answer) {
+      $correct = true;
+    }
+  }
+
+  if ($correct) {
+    $stmt = $pdo->prepare("INSERT INTO 正解記録 (user_id, quiz_id) VALUES (?, ?)");
+    $stmt->execute([$_SESSION['user'], $quiz_id]);
+    $result_message = "<p class='correct'>🎉 正解！</p>";
+  } else {
+    $result_message = "<p class='wrong'>❌ 不正解。正解は：{$correct_answer}</p>";
+  }
+  $result_message .= "<p class='explain'>解説：{$explanation}</p>";
 }
 ?>
-<h1><?php echo $quiz['question']; ?></h1>
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>クイズ</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    .correct { color: green; font-weight: bold; animation: fadeIn 1s; }
+    .wrong { color: red; font-weight: bold; animation: shake 0.5s; }
+    .explain { margin-top: 1em; color: #333; }
+    @keyframes fadeIn { from {opacity:0;} to {opacity:1;} }
+    @keyframes shake {
+      0% { transform: translateX(0); }
+      25% { transform: translateX(-5px); }
+      50% { transform: translateX(5px); }
+      75% { transform: translateX(-5px); }
+      100% { transform: translateX(0); }
+    }
+  </style>
+</head>
+<body>
+<h1>🧠 クイズに挑戦！</h1>
+
+<p><strong>問題：</strong> <?= htmlspecialchars($question) ?></p>
+
 <form method="post">
-<?php if ($quiz['type'] === 'choice'): ?>
-  <?php foreach (json_decode($quiz['choices']) as $choice): ?>
-    <label><input type="radio" name="answer" value="<?php echo $choice; ?>"><?php echo $choice; ?></label><br>
+<?php if ($format === '選択式'): ?>
+  <?php
+    $stmt = $pdo->prepare("SELECT 選択式 FROM 選択式 WHERE id = ?");
+    $stmt->execute([$quiz_id]);
+    $choices = explode(',', $stmt->fetchColumn());
+    shuffle($choices);
+    foreach ($choices as $choice):
+  ?>
+    <label><input type="radio" name="answer" value="<?= htmlspecialchars($choice) ?>" required> <?= htmlspecialchars($choice) ?></label><br>
   <?php endforeach; ?>
 <?php else: ?>
-  <input type="text" name="answer">
+  <input type="text" name="answer" required>
 <?php endif; ?>
-  <button type="submit">Submit</button>
+  <button type="submit">回答する</button>
 </form>
+
+<?= $result_message ?>
+
+</body>
+</html>
