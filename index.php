@@ -1,9 +1,27 @@
 <?php
 session_start();
-$data_file = 'quiz_data.json';
+
+// データ保存ディレクトリ
+$data_dir = __DIR__ . '/data';
+if (!file_exists($data_dir)) {
+    mkdir($data_dir, 0777, true);
+}
+
+// データファイルパス
+$user_file = $data_dir . '/user.json';
+$quiz_file = $data_dir . '/quiz.json';
+
+// データ初期化
+if (!file_exists($user_file)) {
+    file_put_contents($user_file, json_encode(['results' => []]));
+}
+if (!file_exists($quiz_file)) {
+    file_put_contents($quiz_file, json_encode(['events' => []]));
+}
 
 // データ読み込み
-$data = json_decode(file_get_contents($data_file), true) ?? ['events' => [], 'results' => []];
+$user_data = json_decode(file_get_contents($user_file), true);
+$quiz_data = json_decode(file_get_contents($quiz_file), true);
 
 // ユーザー識別用ID生成
 if (!isset($_COOKIE['user_id'])) {
@@ -13,45 +31,67 @@ if (!isset($_COOKIE['user_id'])) {
     $user_id = $_COOKIE['user_id'];
 }
 
+// クリア報告処理
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['report_clear'])) {
+    $admin_code = trim($_POST['admin_code']);
+    if (preg_match('/^admin_[a-zA-Z0-9]{8,}$/', $admin_code)) {
+        $_SESSION['clear_reported'] = true;
+        
+        // ユーザーデータにクリア報告を記録
+        $user_data['results'][] = [
+            'user_id' => $user_id,
+            'event_name' => 'クリア報告',
+            'quiz_id' => 'admin_report',
+            'is_correct' => true,
+            'timestamp' => date('Y-m-d H:i:s')
+        ];
+        
+        file_put_contents($user_file, json_encode($user_data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+        $success = "クリア報告が完了しました！運営からの確認をお待ちください。";
+    } else {
+        $error = "無効な管理者コードです。'admin_'で始まる正しいコードを入力してください。";
+    }
+}
+
 // クイズ回答処理
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_answer'])) {
     $quiz_id = $_POST['quiz_id'];
-    $user_answer = $_POST['answer'];
-    $hint_level = $_POST['hint_level'] ?? 0;
+    $user_answer = trim($_POST['answer']);
+    $hint_level = (int)($_POST['hint_level'] ?? 0);
     
-    foreach ($data['events'] as $event) {
+    foreach ($quiz_data['events'] as $event) {
         if (isset($event['quizzes'][$quiz_id])) {
             $is_correct = (strtolower($user_answer) === strtolower($event['quizzes'][$quiz_id]['answer']));
             
-            $result = [
-                'quiz_id' => $quiz_id,
-                'is_correct' => $is_correct,
-                'timestamp' => date('Y-m-d H:i:s'),
+            // 回答結果を記録
+            $user_data['results'][] = [
                 'user_id' => $user_id,
                 'event_name' => $event['name'],
-                'hint_used' => $hint_level
+                'quiz_id' => $quiz_id,
+                'is_correct' => $is_correct,
+                'timestamp' => date('Y-m-d H:i:s')
             ];
             
-            $data['results'][] = $result;
-            file_put_contents($data_file, json_encode($data, JSON_UNESCAPED_UNICODE));
+            file_put_contents($user_file, json_encode($user_data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
             
             if ($is_correct) {
                 header("Location: index.php?quiz_id=".$quiz_id."&result=1");
+                exit;
             } else {
-                $hint_level++;
+                $hint_level = min($hint_level + 1, 3);
                 header("Location: index.php?quiz_id=".$quiz_id."&hint=".$hint_level);
+                exit;
             }
-            exit;
         }
     }
 }
 
 // 現在のクイズ情報取得
 $current_quiz = null;
-$hint_level = isset($_GET['hint']) ? (int)$_GET['hint'] : 0;
+$hint_level = isset($_GET['hint']) ? min((int)$_GET['hint'], 3) : 0;
 $show_result = isset($_GET['result']);
 if (isset($_GET['quiz_id'])) {
-    foreach ($data['events'] as $event) {
+    foreach ($quiz_data['events'] as $event) {
         if (isset($event['quizzes'][$_GET['quiz_id']])) {
             $current_quiz = $event['quizzes'][$_GET['quiz_id']];
             $current_quiz['id'] = $_GET['quiz_id'];
@@ -61,20 +101,15 @@ if (isset($_GET['quiz_id'])) {
     }
 }
 
-// マイページ用データ取得
-$my_results = array_filter($data['results'], function($r) use ($user_id) {
-    return $r['user_id'] === $user_id;
-});
-
 // イベントごとの進捗計算
 $event_progress = [];
-foreach ($data['events'] as $event) {
+foreach ($quiz_data['events'] as $event) {
     $total = count($event['quizzes']);
     $completed = 0;
     
     foreach ($event['quizzes'] as $quiz_id => $quiz) {
-        foreach ($my_results as $result) {
-            if ($result['quiz_id'] === $quiz_id && $result['is_correct']) {
+        foreach ($user_data['results'] as $result) {
+            if ($result['user_id'] === $user_id && $result['quiz_id'] === $quiz_id && $result['is_correct']) {
                 $completed++;
                 break;
             }
@@ -95,6 +130,9 @@ foreach ($event_progress as $progress) {
         break;
     }
 }
+
+// クリア報告済みかチェック
+$clear_reported = $_SESSION['clear_reported'] ?? false;
 ?>
 <!DOCTYPE html>
 <html lang="ja">
@@ -104,51 +142,298 @@ foreach ($event_progress as $progress) {
     <title>QRクイズシステム</title>
     <script src="https://cdn.rawgit.com/davidshimjs/qrcodejs/gh-pages/qrcode.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+    <script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f9f9f9; }
-        .quiz-container { display: flex; flex-direction: column; gap: 20px; margin-top: 20px; }
-        @media (min-width: 768px) {
-            .quiz-container { flex-direction: row; }
+        :root {
+            --primary-color: #4285f4;
+            --success-color: #34a853;
+            --warning-color: #fbbc05;
+            --danger-color: #ea4335;
+            --light-bg: #f8f9fa;
+            --dark-text: #202124;
+            --light-text: #5f6368;
         }
-        .quiz-image { max-width: 100%; height: auto; max-height: 60vh; border: 1px solid #ddd; border-radius: 8px; }
-        .qr-code { margin-top: 20px; text-align: center; display: none; } /* 最初は非表示 */
-        .hint-box { margin-top: 20px; padding: 15px; background: #fff8e1; border-radius: 8px; border-left: 4px solid #ffc107; }
-        .answer-form { margin-top: 20px; }
-        .answer-form input { width: 100%; padding: 12px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 8px; font-size: 16px; }
-        .btn { background: #4285f4; color: white; border: none; padding: 12px 15px; cursor: pointer; border-radius: 8px; font-size: 16px; text-align: center; display: block; width: 100%; }
-        .btn-secondary { background: #34a853; }
-        .btn-warning { background: #fbbc05; }
-        .btn-danger { background: #ea4335; }
-        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); justify-content: center; align-items: center; z-index: 1000; }
-        .modal-content { background: white; padding: 20px; border-radius: 12px; width: 90%; max-width: 500px; max-height: 90vh; overflow-y: auto; }
-        .nav { display: flex; justify-content: space-between; margin-bottom: 20px; align-items: center; }
-        .progress-container { margin: 20px 0; }
-        .progress-bar { height: 20px; background: #e9ecef; border-radius: 10px; overflow: hidden; }
-        .progress { height: 100%; background: #34a853; transition: width 0.3s; }
-        .progress-text { margin-top: 5px; text-align: center; color: #666; }
-        .close-btn { position: absolute; top: 10px; right: 10px; cursor: pointer; font-size: 24px; color: #333; }
-        #scannerVideo, #adminScannerVideo { width: 100%; border-radius: 8px; background: #000; }
-        .result-message { padding: 15px; border-radius: 8px; margin-top: 20px; text-align: center; }
-        .correct { background: #e6f4ea; color: #34a853; border-left: 4px solid #34a853; }
-        .incorrect { background: #fce8e6; color: #ea4335; border-left: 4px solid #ea4335; }
-        .hidden { display: none; }
-        .scanner-instruction { text-align: center; margin: 10px 0; color: white; }
-        @media (max-width: 480px) {
-            body { padding: 15px; }
-            .btn { padding: 14px 15px; }
-            .quiz-image { max-height: 50vh; }
+        
+        body {
+            font-family: 'Roboto', -apple-system, BlinkMacSystemFont, 'Segoe UI', Oxygen, Ubuntu, Cantarell, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f9f9f9;
+            color: var(--dark-text);
+            line-height: 1.6;
+        }
+        
+        .nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #eee;
+        }
+        
+        .btn {
+            display: inline-block;
+            padding: 10px 15px;
+            border-radius: 8px;
+            background: var(--primary-color);
+            color: white;
+            text-decoration: none;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.3s;
+        }
+        
+        .btn:hover {
+            background: #3367d6;
+        }
+        
+        .btn-secondary {
+            background: var(--light-text);
+        }
+        
+        .btn-secondary:hover {
+            background: #4e555b;
+        }
+        
+        .btn-warning {
+            background: var(--warning-color);
+            color: var(--dark-text);
+        }
+        
+        .btn-warning:hover {
+            background: #e9b000;
+        }
+        
+        .btn-danger {
+            background: var(--danger-color);
+        }
+        
+        .btn-danger:hover {
+            background: #d33426;
+        }
+        
+        .success-message {
+            padding: 15px;
+            background: #e6f4ea;
+            color: var(--success-color);
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .error-message {
+            padding: 15px;
+            background: #f8d7da;
+            color: var(--danger-color);
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .quiz-container {
+            display: flex;
+            gap: 30px;
+            margin-top: 20px;
+        }
+        
+        .quiz-image {
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        
+        .answer-form input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            margin-bottom: 15px;
+            box-sizing: border-box;
+        }
+        
+        .result-message {
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        
+        .result-message.correct {
+            background: #e6f4ea;
+            color: var(--success-color);
+            border: 1px solid #c3e6cb;
+        }
+        
+        .result-message.incorrect {
+            background: #f8d7da;
+            color: var(--danger-color);
+            border: 1px solid #f5c6cb;
+        }
+        
+        .hint-box {
+            padding: 15px;
+            background: #fff8e1;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border: 1px solid #ffe082;
+        }
+        
+        .progress-container {
+            margin-bottom: 25px;
+        }
+        
+        .progress-bar {
+            height: 20px;
+            background: #e9ecef;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        
+        .progress {
+            height: 100%;
+            background: var(--primary-color);
+            transition: width 0.3s;
+        }
+        
+        .progress-text {
+            font-size: 14px;
+            color: var(--light-text);
+        }
+        
+        .clear-report-form {
+            padding: 20px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            margin-top: 30px;
+        }
+        
+        .clear-report-form input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            margin-bottom: 15px;
+            box-sizing: border-box;
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.7);
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        
+        .modal-content {
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            width: 90%;
+            max-width: 500px;
+            position: relative;
+        }
+        
+        .close-btn {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            font-size: 24px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            color: var(--light-text);
+        }
+        
+        .scanner-instruction {
+            text-align: center;
+            margin-bottom: 15px;
+            color: var(--light-text);
+        }
+        
+        #scannerVideo, #adminScannerVideo {
+            width: 100%;
+            border-radius: 8px;
+            background: black;
+        }
+        
+        #adminScanResult {
+            text-align: center;
+            margin: 10px 0;
+            font-weight: bold;
+        }
+        
+        .ad-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 2000;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .ad-content {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            max-width: 90%;
+            text-align: center;
+        }
+        
+        .ad-close {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: white;
+        }
+        
+        .image-fallback {
+            padding: 20px;
+            background: #f0f0f0;
+            border-radius: 8px;
+            text-align: center;
+            margin-bottom: 20px;
         }
     </style>
 </head>
 <body>
     <div class="nav">
-        <h1 style="margin: 0; color: #4285f4;">QRクイズシステム</h1>
+        <h1 style="margin: 0; color: var(--primary-color);">QRクイズシステム</h1>
         <?php if (!isset($_GET['page']) || $_GET['page'] !== 'mypage'): ?>
             <a href="index.php?page=mypage" class="btn btn-secondary">マイページ</a>
         <?php else: ?>
             <a href="index.php" class="btn">クイズに戻る</a>
         <?php endif; ?>
     </div>
+    
+    <?php if (isset($success)): ?>
+        <div class="success-message"><?= htmlspecialchars($success) ?></div>
+    <?php endif; ?>
+    
+    <?php if (isset($error)): ?>
+        <div class="error-message"><?= htmlspecialchars($error) ?></div>
+    <?php endif; ?>
     
     <?php if (isset($_GET['page']) && $_GET['page'] === 'mypage'): ?>
         <h2>マイページ</h2>
@@ -169,51 +454,57 @@ foreach ($event_progress as $progress) {
             <?php endif; ?>
         <?php endforeach; ?>
         
-        <?php if ($all_cleared): ?>
-            <div style="margin-top: 30px; text-align: center; padding: 20px; background: #e8f0fe; border-radius: 8px;">
-                <h3 style="color: #4285f4;">🎉 すべてのクイズをクリアしました！ 🎉</h3>
-                <p>おめでとうございます！</p>
+        <?php if ($all_cleared && !$clear_reported): ?>
+            <div class="clear-report-form">
+                <h3 style="margin-top: 0; color: var(--primary-color);">🎉 すべてのクイズをクリアしました！ 🎉</h3>
+                <p>運営にクリアを報告してください</p>
+                
+                <form method="POST" id="clearReportForm">
+                    <input type="text" name="admin_code" placeholder="admin_xxxxxxxx" required
+                           pattern="admin_[a-zA-Z0-9]{8,}" 
+                           title="運営から提供されたadmin_で始まるコードを入力">
+                    <button type="submit" name="report_clear" class="btn">クリア報告を送信</button>
+                </form>
+                
+                <p style="text-align: center; margin: 15px 0;">または</p>
+                
+                <button onclick="showCameraGuide('admin')" class="btn btn-warning">運営QRコードをスキャン</button>
+            </div>
+        <?php elseif ($all_cleared && $clear_reported): ?>
+            <div style="margin-top: 30px; padding: 20px; background: #e6f4ea; border-radius: 12px; text-align: center;">
+                <h3 style="margin-top: 0; color: var(--success-color);">🎉 クリア報告済み 🎉</h3>
+                <p>運営からの確認をお待ちください</p>
             </div>
         <?php endif; ?>
         
-        <h3>回答履歴</h3>
-        <?php if (!empty($my_results)): ?>
-            <div style="overflow-x: auto;">
-                <table style="width: 100%; border-collapse: collapse;">
-                    <thead>
-                        <tr style="background: #f1f3f4;">
-                            <th style="padding: 12px; border: 1px solid #ddd;">イベント名</th>
-                            <th style="padding: 12px; border: 1px solid #ddd;">結果</th>
-                            <th style="padding: 12px; border: 1px solid #ddd;">ヒント使用</th>
-                            <th style="padding: 12px; border: 1px solid #ddd;">日時</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($my_results as $result): ?>
-                            <tr>
-                                <td style="padding: 12px; border: 1px solid #ddd;"><?= htmlspecialchars($result['event_name']) ?></td>
-                                <td style="padding: 12px; border: 1px solid #ddd; color: <?= $result['is_correct'] ? '#34a853' : '#ea4335' ?>">
-                                    <?= $result['is_correct'] ? '正解' : '不正解' ?>
-                                </td>
-                                <td style="padding: 12px; border: 1px solid #ddd;"><?= $result['hint_used'] ?>回</td>
-                                <td style="padding: 12px; border: 1px solid #ddd;"><?= $result['timestamp'] ?></td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
+        <!-- 管理者QRスキャナーモーダル -->
+        <div id="adminScannerModal" class="modal">
+            <div class="modal-content">
+                <button class="close-btn" onclick="hideAdminScanner()">&times;</button>
+                <h2 style="text-align: center; margin-top: 0;">運営QRコードをスキャン</h2>
+                <p class="scanner-instruction">カメラを運営のQRコードに向けてください</p>
+                <video id="adminScannerVideo" playsinline></video>
+                <div id="adminScanResult"></div>
+                <div style="text-align: center; margin-top: 15px;">
+                    <button onclick="hideAdminScanner()" class="btn btn-danger">キャンセル</button>
+                </div>
             </div>
-        <?php else: ?>
-            <p style="padding: 15px; background: #f1f3f4; border-radius: 8px; text-align: center;">まだ回答履歴がありません</p>
-        <?php endif; ?>
+        </div>
         
     <?php elseif ($current_quiz): ?>
         <div class="quiz-container">
             <div style="flex: 1;">
-                <img src="data:image/png;base64,<?= $current_quiz['question'] ?>" class="quiz-image" alt="クイズ画像">
+                <?php if ($current_quiz['question']): ?>
+                    <img src="<?= htmlspecialchars($current_quiz['question']) ?>" class="quiz-image" alt="クイズ画像" onerror="handleImageError(this)">
+                <?php else: ?>
+                    <div class="image-fallback">
+                        <p>画像がありません</p>
+                    </div>
+                <?php endif; ?>
                 
                 <?php if ($show_result): ?>
                     <div class="result-message <?= $_GET['result'] === '1' ? 'correct' : 'incorrect' ?>">
-                        <h2><?= $_GET['result'] === '1' ? '正解！' : '不正解' ?></h2>
+                        <h2 style="margin-top: 0;"><?= $_GET['result'] === '1' ? '正解！' : '不正解' ?></h2>
                         <?php if ($_GET['result'] === '1'): ?>
                             <p>おめでとうございます！</p>
                             <a href="index.php" class="btn">他のクイズに挑戦</a>
@@ -231,28 +522,29 @@ foreach ($event_progress as $progress) {
                     
                     <?php if ($hint_level > 0 && !empty($current_quiz['hints'])): ?>
                         <div class="hint-box">
-                            <h3>ヒント #<?= $hint_level ?></h3>
+                            <h3 style="margin-top: 0;">ヒント #<?= $hint_level ?></h3>
                             <?php for ($i = 0; $i < min($hint_level, count($current_quiz['hints'])); $i++): ?>
                                 <p><?= ($i+1).'. '.htmlspecialchars($current_quiz['hints'][$i]) ?></p>
                             <?php endfor; ?>
                         </div>
                     <?php endif; ?>
                     
-                    <?php if (!$show_result): ?>
+                    <?php if (!$show_result && !empty($current_quiz['hints']) && $hint_level < 3): ?>
                         <button onclick="location.href='index.php?quiz_id=<?= $current_quiz['id'] ?>&hint=<?= $hint_level + 1 ?>'" 
-                                class="btn btn-warning" style="margin-top: 10px;">
+                                class="btn btn-warning">
                             ヒントを見る (<?= $hint_level + 1 ?>回目)
                         </button>
                     <?php endif; ?>
                 <?php endif; ?>
             </div>
             
-            <!-- 正解時のみQRコードを表示 -->
             <?php if ($show_result && $_GET['result'] === '1'): ?>
                 <div style="min-width: 200px;">
                     <div class="qr-code" id="quizQR" style="display: block;"></div>
-                    <p style="text-align: center; font-size: 14px; color: #666; margin-top: 5px;">クイズID: <?= $current_quiz['id'] ?></p>
-                    <button onclick="startScanner()" class="btn" style="margin-top: 10px;">QRコードをスキャン</button>
+                    <p style="text-align: center; font-size: 14px; color: var(--light-text); margin-top: 5px;">
+                        クイズID: <?= $current_quiz['id'] ?>
+                    </p>
+                    <button onclick="showCameraGuide('normal')" class="btn" style="margin-top: 10px;">QRコードをスキャン</button>
                 </div>
             <?php endif; ?>
         </div>
@@ -260,7 +552,7 @@ foreach ($event_progress as $progress) {
         <!-- QRスキャナーモーダル -->
         <div id="scannerModal" class="modal">
             <div class="modal-content">
-                <span class="close-btn" onclick="stopScanner()">&times;</span>
+                <button class="close-btn" onclick="stopScanner()">&times;</button>
                 <h2 style="text-align: center; margin-top: 0;">QRコードをスキャン</h2>
                 <p class="scanner-instruction">カメラをQRコードに向けてください</p>
                 <video id="scannerVideo" playsinline></video>
@@ -283,105 +575,303 @@ foreach ($event_progress as $progress) {
                 });
             <?php endif; ?>
             
-            // QRスキャナー機能 (モバイル対応版)
+            // 画像読み込みエラー処理
+            function handleImageError(img) {
+                const container = img.parentNode;
+                const fallback = document.createElement('div');
+                fallback.className = 'image-fallback';
+                fallback.textContent = '画像を読み込めませんでした';
+                container.replaceChild(fallback, img);
+            }
+            
+            // カメラ使用前のガイド表示
+            function showCameraGuide(type) {
+                const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+                const message = type === 'admin' 
+                    ? '運営QRコードをスキャンするにはカメラの使用許可が必要です。許可しますか？' 
+                    : 'QRコードをスキャンするにはカメラの使用許可が必要です。許可しますか？';
+                
+                if (isMobile) {
+                    if (confirm(message)) {
+                        type === 'admin' ? startAdminScanner() : startScanner();
+                    }
+                } else {
+                    type === 'admin' ? startAdminScanner() : startScanner();
+                }
+            }
+            
+            // QRスキャナー機能
+            const qrVideo = document.getElementById('scannerVideo');
             let scannerStream = null;
-            let scanInterval = null;
+            let animationFrame = null;
             
             function startScanner() {
                 const modal = document.getElementById('scannerModal');
                 modal.style.display = 'flex';
                 
-                // カメラデバイスの選択 (環境カメラ優先)
-                const constraints = {
-                    video: {
-                        facingMode: 'environment',
-                        width: { ideal: 1280 },
-                        height: { ideal: 720 }
-                    }
-                };
-                
-                // モバイルデバイスで環境カメラが利用できない場合のフォールバック
-                const fallbackConstraints = {
-                    video: {
-                        facingMode: { exact: 'user' },
-                        width: { ideal: 1280 },
-                        height: { ideal: 720 }
-                    }
-                };
-                
-                function startWithConstraints(constraints) {
-                    navigator.mediaDevices.getUserMedia(constraints)
-                        .then(stream => {
-                            scannerStream = stream;
-                            const video = document.getElementById('scannerVideo');
-                            video.srcObject = stream;
-                            
-                            video.onloadedmetadata = () => {
-                                video.play().catch(e => {
-                                    console.error('Video play error:', e);
-                                    alert('カメラの起動に失敗しました。ページを再読み込みしてください。');
-                                    stopScanner();
-                                });
-                                
-                                // スキャン処理開始
-                                const canvas = document.createElement('canvas');
-                                const ctx = canvas.getContext('2d');
-                                
-                                scanInterval = setInterval(() => {
-                                    if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                                        try {
-                                            canvas.width = video.videoWidth;
-                                            canvas.height = video.videoHeight;
-                                            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                                            
-                                            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                                            const code = jsQR(imageData.data, imageData.width, imageData.height, {
-                                                inversionAttempts: 'dontInvert',
-                                            });
-                                            
-                                            if (code) {
-                                                clearInterval(scanInterval);
-                                                window.location.href = 'index.php?quiz_id=' + code.data;
-                                                stopScanner();
-                                            }
-                                        } catch (e) {
-                                            console.error('QRスキャンエラー:', e);
-                                        }
-                                    }
-                                }, 300);
-                            };
-                        })
-                        .catch(err => {
-                            console.error('カメラエラー:', err);
-                            // 環境カメラが失敗したらフロントカメラを試す
-                            if (JSON.stringify(constraints) !== JSON.stringify(fallbackConstraints)) {
-                                startWithConstraints(fallbackConstraints);
-                            } else {
-                                alert('カメラへのアクセスがブロックされました。以下の方法をお試しください:\n\n1. ブラウザの設定でカメラ権限を許可\n2. クイズIDを直接入力\n3. 別のブラウザをお試しください');
-                                stopScanner();
-                            }
-                        });
+                // 互換性チェック
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    alert('このブラウザではカメラ機能を利用できません。最新版のChromeまたはFirefoxをお試しください。');
+                    modal.style.display = 'none';
+                    return;
                 }
                 
-                startWithConstraints(constraints);
+                // HTTPSチェック（ローカル環境を除く）
+                if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+                    alert('カメラを使用するにはHTTPS接続が必要です。安全な接続に切り替えてください。');
+                    modal.style.display = 'none';
+                    return;
+                }
+                
+                async function startCamera() {
+                    try {
+                        // 背面カメラを強制
+                        let constraints = { 
+                            video: { 
+                                facingMode: { exact: "environment" }, // 外カメラを強制
+                                width: { ideal: 1280 },
+                                height: { ideal: 720 }
+                            } 
+                        };
+                        
+                        // 背面カメラが使えない場合のフォールバック
+                        try {
+                            scannerStream = await navigator.mediaDevices.getUserMedia(constraints);
+                        } catch (err) {
+                            console.log('背面カメラにアクセスできませんでした。前面カメラを試します...');
+                            constraints.video.facingMode = 'user';
+                            scannerStream = await navigator.mediaDevices.getUserMedia(constraints);
+                        }
+                        
+                        qrVideo.srcObject = scannerStream;
+                        await qrVideo.play();
+                        
+                        startScanning();
+                        
+                    } catch (err) {
+                        console.error('カメラエラー:', err);
+                        let errorMessage = 'カメラにアクセスできませんでした';
+                        
+                        if (err.name === 'NotAllowedError') {
+                            errorMessage = 'カメラの使用許可が必要です。ブラウザの設定を確認してください。';
+                        } else if (err.name === 'NotFoundError') {
+                            errorMessage = '利用可能なカメラが見つかりませんでした。';
+                        } else if (err.name === 'NotReadableError') {
+                            errorMessage = 'カメラが他のアプリで使用中かもしれません。';
+                        }
+                        
+                        alert(errorMessage);
+                        modal.style.display = 'none';
+                    }
+                }
+                
+                function startScanning() {
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    
+                    function scanFrame() {
+                        if (qrVideo.readyState === qrVideo.HAVE_ENOUGH_DATA) {
+                            canvas.width = qrVideo.videoWidth;
+                            canvas.height = qrVideo.videoHeight;
+                            
+                            try {
+                                ctx.drawImage(qrVideo, 0, 0, canvas.width, canvas.height);
+                                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                                const code = jsQR(imageData.data, imageData.width, imageData.height, {
+                                    inversionAttempts: 'dontInvert',
+                                });
+                                
+                                if (code) {
+                                    stopScanner();
+                                    showAdAfterScan(); // QRコード読み取り後に広告表示
+                                    window.location.href = 'index.php?quiz_id=' + code.data;
+                                }
+                            } catch (e) {
+                                console.error('スキャンエラー:', e);
+                            }
+                        }
+                        
+                        animationFrame = requestAnimationFrame(scanFrame);
+                    }
+                    
+                    scanFrame();
+                }
+                
+                startCamera();
             }
             
             function stopScanner() {
-                if (scanInterval) {
-                    clearInterval(scanInterval);
-                    scanInterval = null;
+                if (animationFrame) {
+                    cancelAnimationFrame(animationFrame);
+                    animationFrame = null;
                 }
+                
                 if (scannerStream) {
                     scannerStream.getTracks().forEach(track => track.stop());
+                    qrVideo.srcObject = null;
                     scannerStream = null;
                 }
+                
                 document.getElementById('scannerModal').style.display = 'none';
+            }
+            
+            // 管理者QRスキャナー機能
+            const adminVideo = document.getElementById('adminScannerVideo');
+            let adminScannerStream = null;
+            let adminAnimationFrame = null;
+            
+            function startAdminScanner() {
+                const modal = document.getElementById('adminScannerModal');
+                modal.style.display = 'flex';
+                document.getElementById('adminScanResult').textContent = '';
+                
+                // 互換性チェック
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    alert('このブラウザではカメラ機能を利用できません。最新版のChromeまたはFirefoxをお試しください。');
+                    modal.style.display = 'none';
+                    return;
+                }
+                
+                // HTTPSチェック（ローカル環境を除く）
+                if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+                    alert('カメラを使用するにはHTTPS接続が必要です。安全な接続に切り替えてください。');
+                    modal.style.display = 'none';
+                    return;
+                }
+                
+                async function startCamera() {
+                    try {
+                        // 背面カメラを強制
+                        let constraints = { 
+                            video: { 
+                                facingMode: { exact: "environment" }, // 外カメラを強制
+                                width: { ideal: 1280 },
+                                height: { ideal: 720 }
+                            } 
+                        };
+                        
+                        // 背面カメラが使えない場合のフォールバック
+                        try {
+                            adminScannerStream = await navigator.mediaDevices.getUserMedia(constraints);
+                        } catch (err) {
+                            console.log('背面カメラにアクセスできませんでした。前面カメラを試します...');
+                            constraints.video.facingMode = 'user';
+                            adminScannerStream = await navigator.mediaDevices.getUserMedia(constraints);
+                        }
+                        
+                        adminVideo.srcObject = adminScannerStream;
+                        await adminVideo.play();
+                        
+                        startAdminScanning();
+                        
+                    } catch (err) {
+                        console.error('カメラエラー:', err);
+                        let errorMessage = 'カメラにアクセスできませんでした';
+                        
+                        if (err.name === 'NotAllowedError') {
+                            errorMessage = 'カメラの使用許可が必要です。ブラウザの設定を確認してください。';
+                        } else if (err.name === 'NotFoundError') {
+                            errorMessage = '利用可能なカメラが見つかりませんでした。';
+                        } else if (err.name === 'NotReadableError') {
+                            errorMessage = 'カメラが他のアプリで使用中かもしれません。';
+                        }
+                        
+                        alert(errorMessage);
+                        modal.style.display = 'none';
+                    }
+                }
+                
+                function startAdminScanning() {
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    
+                    function scanFrame() {
+                        if (adminVideo.readyState === adminVideo.HAVE_ENOUGH_DATA) {
+                            canvas.width = adminVideo.videoWidth;
+                            canvas.height = adminVideo.videoHeight;
+                            
+                            try {
+                                ctx.drawImage(adminVideo, 0, 0, canvas.width, canvas.height);
+                                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                                const code = jsQR(imageData.data, imageData.width, imageData.height, {
+                                    inversionAttempts: 'dontInvert',
+                                });
+                                
+                                if (code) {
+                                    if (code.data.startsWith('admin_')) {
+                                        document.getElementById('adminScanResult').textContent = '有効なQRコードを検出しました...';
+                                        document.getElementById('adminScanResult').style.color = 'var(--success-color)';
+                                        
+                                        // フォームに値を設定して送信
+                                        setTimeout(() => {
+                                            document.getElementById('clearReportForm').querySelector('input[name="admin_code"]').value = code.data;
+                                            document.getElementById('clearReportForm').submit();
+                                        }, 1000);
+                                    } else {
+                                        document.getElementById('adminScanResult').textContent = '無効なQRコードです';
+                                        document.getElementById('adminScanResult').style.color = 'var(--danger-color)';
+                                    }
+                                }
+                            } catch (e) {
+                                console.error('QRスキャンエラー:', e);
+                            }
+                        }
+                        
+                        adminAnimationFrame = requestAnimationFrame(scanFrame);
+                    }
+                    
+                    scanFrame();
+                }
+                
+                startCamera();
+            }
+            
+            function hideAdminScanner() {
+                if (adminAnimationFrame) {
+                    cancelAnimationFrame(adminAnimationFrame);
+                    adminAnimationFrame = null;
+                }
+                
+                if (adminScannerStream) {
+                    adminScannerStream.getTracks().forEach(track => track.stop());
+                    adminVideo.srcObject = null;
+                    adminScannerStream = null;
+                }
+                
+                document.getElementById('adminScannerModal').style.display = 'none';
+            }
+            
+            // 広告表示関数
+            function showAdAfterScan() {
+                document.getElementById('adModal').style.display = 'flex';
+                
+                // 必要に応じてユーザーデータをリセット
+                // fetch('reset_user_data.php', { method: 'POST' });
+            }
+            
+            function closeAdModal() {
+                document.getElementById('adModal').style.display = 'none';
             }
             
             // モーダル外をクリックで閉じる
             window.addEventListener('click', function(event) {
                 if (event.target === document.getElementById('scannerModal')) {
                     stopScanner();
+                }
+                if (event.target === document.getElementById('adminScannerModal')) {
+                    hideAdminScanner();
+                }
+                if (event.target === document.getElementById('adModal')) {
+                    closeAdModal();
+                }
+            });
+            
+            // フォームバリデーション
+            document.getElementById('clearReportForm')?.addEventListener('submit', function(e) {
+                const adminCode = this.querySelector('input[name="admin_code"]').value.trim();
+                if (!/^admin_[a-zA-Z0-9]{8,}$/.test(adminCode)) {
+                    e.preventDefault();
+                    alert('admin_で始まる有効なコードを入力してください（8文字以上）');
                 }
             });
         </script>
@@ -390,11 +880,11 @@ foreach ($event_progress as $progress) {
             <h2>QRクイズに参加</h2>
             <p>QRコードをスキャンするか、クイズIDを入力してください</p>
             
-            <button onclick="startScanner()" class="btn" style="margin: 20px 0;">QRコードをスキャン</button>
+            <button onclick="showCameraGuide('normal')" class="btn" style="margin: 20px 0;">QRコードをスキャン</button>
             
             <form method="GET" style="margin-top: 20px;">
                 <input type="text" name="quiz_id" placeholder="クイズIDを入力" required 
-                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 16px;">
+                       style="width: 100%; padding: 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 16px; box-sizing: border-box;">
                 <button type="submit" class="btn" style="margin-top: 10px;">クイズ開始</button>
             </form>
         </div>
@@ -402,7 +892,7 @@ foreach ($event_progress as $progress) {
         <!-- ホーム用QRスキャナーモーダル -->
         <div id="scannerModal" class="modal">
             <div class="modal-content">
-                <span class="close-btn" onclick="stopScanner()">&times;</span>
+                <button class="close-btn" onclick="stopScanner()">&times;</button>
                 <h2 style="text-align: center; margin-top: 0;">QRコードをスキャン</h2>
                 <p class="scanner-instruction">カメラをQRコードに向けてください</p>
                 <video id="scannerVideo" playsinline></video>
@@ -411,105 +901,19 @@ foreach ($event_progress as $progress) {
                 </div>
             </div>
         </div>
-        
-        <script>
-            // ホーム画面用QRスキャナー
-            let scannerStream = null;
-            let scanInterval = null;
-            
-            function startScanner() {
-                const modal = document.getElementById('scannerModal');
-                modal.style.display = 'flex';
-                
-                const constraints = {
-                    video: {
-                        facingMode: 'environment',
-                        width: { ideal: 1280 },
-                        height: { ideal: 720 }
-                    }
-                };
-                
-                const fallbackConstraints = {
-                    video: {
-                        facingMode: { exact: 'user' },
-                        width: { ideal: 1280 },
-                        height: { ideal: 720 }
-                    }
-                };
-                
-                function startWithConstraints(constraints) {
-                    navigator.mediaDevices.getUserMedia(constraints)
-                        .then(stream => {
-                            scannerStream = stream;
-                            const video = document.getElementById('scannerVideo');
-                            video.srcObject = stream;
-                            
-                            video.onloadedmetadata = () => {
-                                video.play().catch(e => {
-                                    console.error('Video play error:', e);
-                                    alert('カメラの起動に失敗しました。ページを再読み込みしてください。');
-                                    stopScanner();
-                                });
-                                
-                                const canvas = document.createElement('canvas');
-                                const ctx = canvas.getContext('2d');
-                                
-                                scanInterval = setInterval(() => {
-                                    if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                                        try {
-                                            canvas.width = video.videoWidth;
-                                            canvas.height = video.videoHeight;
-                                            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                                            
-                                            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                                            const code = jsQR(imageData.data, imageData.width, imageData.height, {
-                                                inversionAttempts: 'dontInvert',
-                                            });
-                                            
-                                            if (code) {
-                                                clearInterval(scanInterval);
-                                                window.location.href = 'index.php?quiz_id=' + code.data;
-                                                stopScanner();
-                                            }
-                                        } catch (e) {
-                                            console.error('QRスキャンエラー:', e);
-                                        }
-                                    }
-                                }, 300);
-                            };
-                        })
-                        .catch(err => {
-                            console.error('カメラエラー:', err);
-                            if (JSON.stringify(constraints) !== JSON.stringify(fallbackConstraints)) {
-                                startWithConstraints(fallbackConstraints);
-                            } else {
-                                alert('カメラへのアクセスがブロックされました。以下の方法をお試しください:\n\n1. ブラウザの設定でカメラ権限を許可\n2. クイズIDを直接入力\n3. 別のブラウザをお試しください');
-                                stopScanner();
-                            }
-                        });
-                }
-                
-                startWithConstraints(constraints);
-            }
-            
-            function stopScanner() {
-                if (scanInterval) {
-                    clearInterval(scanInterval);
-                    scanInterval = null;
-                }
-                if (scannerStream) {
-                    scannerStream.getTracks().forEach(track => track.stop());
-                    scannerStream = null;
-                }
-                document.getElementById('scannerModal').style.display = 'none';
-            }
-            
-            window.addEventListener('click', function(event) {
-                if (event.target === document.getElementById('scannerModal')) {
-                    stopScanner();
-                }
-            });
-        </script>
     <?php endif; ?>
+    
+    <div id="adModal" class="ad-modal">
+        <button class="ad-close" onclick="closeAdModal()">×</button>
+        <div class="ad-content">
+            <h2>スペシャルオファー！</h2>
+            <p>クイズクリアおめでとうございます！</p>
+            <p>限定特典をご利用ください</p>
+            <img src="https://via.placeholder.com/300x200" alt="広告画像" style="max-width:100%;" onerror="this.style.display='none'">
+            <button onclick="closeAdModal()" style="margin-top:15px; padding:10px 20px; background:#4CAF50; color:white; border:none; border-radius:5px; cursor:pointer;">
+                閉じる
+            </button>
+        </div>
+    </div>
 </body>
 </html>
